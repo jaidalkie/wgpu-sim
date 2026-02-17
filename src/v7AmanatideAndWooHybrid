@@ -1,0 +1,574 @@
+struct SimParams {
+    size : vec2<u32>,
+    seconds: f32,
+    key_down: u32,
+    mouse: vec2<f32>,
+    mouse_down: u32,
+    key_index: u32,
+};
+struct SimPersist {
+    playerPos: vec3<f32>,
+    padOne: f32,
+    playerAngle: vec2<f32>,
+    padTwo: vec2<f32>,
+};
+struct vector8 {
+    a : vec4<f32>,
+    b : vec4<f32>,
+};
+struct rayInfo {
+    dist : f32,
+    normal : vec3<f32>,
+    uv : vec3<f32>,
+};
+struct sphereIntercept {
+    secantLength : f32,
+    ajacentDist : f32,
+    bounded : bool,
+    within : bool
+}
+const pi = 3.14159265359;
+const wavelengths = vec3<f32>(700,530,440);
+const scatterStrength = 100.0;
+const scatterCo = vec3<f32>(
+pow(400.0/wavelengths.x, 4.0) * scatterStrength,
+pow(400.0/wavelengths.y, 4.0) * scatterStrength,
+pow(400.0/wavelengths.z, 4.0) * scatterStrength
+);
+const planetScale = 10000.0;//6371000.0;// 6371000
+const atmosphereScale = planetScale*1.05;
+const groundScale = planetScale*1.01;
+const sRadius = planetScale;
+const shell = atmosphereScale;
+const sPos = vec3<f32>(0.0,-1.0,0.0)*groundScale;
+//struct Node {
+//    next: u32;
+//    color: vec4<f32>;
+//}
+
+@group(0) @binding(0)
+var outputTex : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(1)
+var<uniform> params : SimParams;
+@group(0) @binding(2)
+var<storage, read_write> player : SimPersist;
+
+@group(1) @binding(0)
+var lutSampler : sampler;
+@group(1) @binding(1)
+var lutTex : texture_2d<f32>;
+
+
+fn samplerOpticalDepth(uv: vec2<f32>) -> f32 {
+    return textureSampleLevel(
+        lutTex,
+        lutSampler,
+        uv,
+        0.0
+    ).r;
+}
+
+
+//@group(0) @binding(2)
+//var<storage, read_write> nodes : array<Node>;
+//@group(0) @binding(3)
+//var<storage, read_write> head : array<u32>;
+//@group(0) @binding(4)
+//var<storage, read_write> allocCounter: atomic<u32>;
+
+// hashing // -----------------------------------------------------------------------------------------------------------------
+
+fn DDHasher(number: vec2<f32>) -> f32 {
+    let number2 = (1./4320.0)*(number)+vec2<f32>(0.25,0.); 
+    let state = fract(dot(number2*number2,vec2<f32>(3571)));
+    return fract(state*state*(3571.*2.));
+}
+fn DDDHasher(number: vec3<f32>) -> f32 {
+    var number2 = fract(number*.1033);
+    number2 = number2 + (dot(number2,number2.yzx + 33.33));
+    return fract((number2.x + number2.y)*number2.z);
+}
+fn DDHashVec(coords: vec2<f32>) -> vec2<f32> {
+    let hashed = DDHasher(coords)*2*pi;
+    return normalize(vec2<f32>(cos(hashed),sin(hashed)));
+}
+fn DDDHashVec(coords: vec3<f32>) -> vec3<f32> { // may have artifacts in its hashing function
+    var number2 = fract(coords*vec3<f32>(.1031, .1030, .0973));
+    number2 = number2 + dot(number2, number2.yzx+33.33);
+    let hashed = fract((number2.xx+number2.yz)*number2.zy)*2*pi;
+
+    return normalize(vec3<f32>(
+    cos(hashed.y)*cos(hashed.x),
+    sin(hashed.y),
+    cos(hashed.y)*sin(hashed.x)
+    ));
+}
+fn DDHash(coords: vec2<f32>) -> vec2<f32> {
+    let res = 100.0;
+    let hashed = floor(DDHasher(coords)*(res*res));
+    let x = f32((hashed%res)/res);
+    let y = f32(floor(hashed/res)/res);
+    return vec2<f32>(x,y);
+}
+fn DDDHash(coords: vec3<f32>) -> vec3<f32> {
+    let res = 100.0;
+    let hashed = floor(DDDHasher(coords)*(res*res*res));
+    let x = hashed%res;
+    let y = floor(hashed/res)%(res);
+    let z = floor(hashed/(res*res));
+    return vec3<f32>(f32(x/res),f32(y/res),f32(z/res));
+}
+
+// components // -----------------------------------------------------------------------------------------------------------------
+
+fn DDDistance(one: vec2<f32>, two: vec2<f32>) -> f32 {
+    let dx = one.x-two.x;
+    let dy = one.y-two.y;
+    return sqrt(dx*dx+dy*dy);
+}
+fn DDDDistance(one: vec3<f32>, two: vec3<f32>) -> f32 {
+    let dx = one.x-two.x;
+    let dy = one.y-two.y;
+    let dz = one.z-two.z;
+    return sqrt(dx*dx+dy*dy+dz*dz);
+}
+
+// noise // -----------------------------------------------------------------------------------------------------------------
+
+fn setVec4(v: vec4<f32>, idx: u32, value: f32) -> vec4<f32> {
+    var r = v;
+    switch idx {
+        case 0u: { r.x = value; }
+        case 1u: { r.y = value; }
+        case 2u: { r.z = value; }
+        case 3u: { r.w = value; }
+        default {}
+    }
+    return r;
+}
+fn octoVal(qO: vec3<f32>, qC: vec3<f32>) -> vector8 {
+    let pos = qC+qO;
+    var octoVal : vector8;
+    octoVal.a = vec4<f32>(0.0);
+    octoVal.b = vec4<f32>(0.0);
+    var counter : u32 = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,0);
+            let qVec = DDDHasher(qPos+qO);
+            octoVal.a = setVec4(
+                octoVal.a,
+                counter,
+                qVec
+            );
+            counter = counter + 1;
+        }
+    }
+    counter = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,1);
+            let qVec = DDDHasher(qPos+qO);
+            octoVal.b = setVec4(
+                octoVal.b,
+                counter,
+                qVec
+            );
+            counter = counter + 1;
+        }
+    }
+    return octoVal;
+}
+fn octoDot(qO: vec3<f32>, qC: vec3<f32>) -> vector8 {
+    let pos = qC+qO;
+    var octoDot : vector8;
+    octoDot.a = vec4<f32>(0.0);
+    octoDot.b = vec4<f32>(0.0);
+    var counter : u32 = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,0);
+            let qVec = DDDHashVec(qPos+qO);
+            octoDot.a = setVec4(
+                octoDot.a,
+                counter,
+                dot(qVec, qC-qPos)
+            );
+            counter = counter + 1;
+        }
+    }
+    counter = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,1);
+            let qVec = DDDHashVec(qPos+qO);
+            octoDot.b = setVec4(
+                octoDot.b,
+                counter,
+                dot(qVec, qC-qPos)
+            );
+            counter = counter + 1;
+        }
+    }
+    return octoDot;
+}
+fn quadDot(qO: vec2<f32>, qC: vec2<f32>) -> vec4<f32> {
+    var quadDot = vec4<f32>(0.0);
+    var counter : u32 = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec2<f32>(x,y);
+            let qVec = DDHashVec(qPos+qO);
+            quadDot[counter] = dot(qVec, qC-qPos);
+            counter = counter + 1;
+        }
+    }
+    return quadDot;
+}
+fn linTerp(ratio: f32, one: f32, two: f32) -> f32 {
+    return one+(ratio)*(two-one);
+}
+fn fade(weight: f32) -> f32 {
+    return weight*weight*weight*(weight*(weight*6.0-15.0)+10.0);
+}
+fn quadlerpfaded(qCoord: vec2<f32>, values: vec4<f32>) -> f32 {
+    let faded = vec2<f32>(fade(qCoord.x),fade(qCoord.y));
+    let one = linTerp(faded.x,values.r,values.g);
+    let two = linTerp(faded.x,values.b,values.a);
+    return linTerp(faded.y,one,two);
+}
+fn octolerpfaded(qC: vec3<f32>, values: vector8) -> f32 {
+    let faded = fade(qC.z);
+    let one = quadlerpfaded(qC.xy,values.a);
+    let two = quadlerpfaded(qC.xy,values.b);
+    return linTerp(faded,one,two);
+}
+fn perlin(coord: vec2<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+    return (quadlerpfaded(qC,quadDot(qO,qC))+1)*0.5;
+}
+fn DDDperlin(coord: vec3<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+    return (octolerpfaded(qC,octoDot(qO,qC))+1)*0.5;
+}
+fn DDDValueNoise(coord: vec3<f32>) ->  f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+    return octolerpfaded(qC,octoVal(qO,qC));
+}
+fn worly(coord: vec2<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+
+    var minimum = 9999.0;
+    let pos = qC+qO;
+    for (var x:f32=-1.0;x<2.0;x=x+1.0) {
+        for (var y:f32=-1.0;y<2.0;y=y+1.0) {
+            let qPos = vec2<f32>(x,y)+qO;
+            let hashedQPos = DDHash(qPos)+qPos;
+            let dist = DDDistance(pos,hashedQPos);
+            if (minimum > dist) {
+                minimum = dist;
+            }
+        }
+    }
+    return min(minimum,1.0);// could use the real upperbound but it has diminishing returns:  /sqrt(2)
+}
+fn DDDWorly(coord: vec3<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+
+    var minimum = 999999.0;
+    let pos = qC+qO;
+    for (var x:f32=-1.0;x<2.0;x=x+1.0) {
+        for (var y:f32=-1.0;y<2.0;y=y+1.0) {
+            for (var z:f32=-1.0;z<2.0;z=z+1.0) {
+                let qPos = vec3<f32>(x,y,z)+qO;
+                let hashedQPos = DDDHash(qPos)+qPos;
+                let dist = DDDDistance(pos,hashedQPos);
+                if (minimum > dist) {
+                    minimum = dist;
+                }
+            }
+        }
+    }
+    return min(minimum,1.0);// could use the real upperbound but it has diminishing returns: /sqrt(3);
+}
+fn DDDboxSDF(cCoord: vec3<f32>, bCoord: vec3<f32>, scale: f32) -> f32 {
+    let f = abs((cCoord-bCoord)-scale)-scale;
+    return length(max(f,vec3(0.0)))+min(max(f.x,max(f.y,f.z)),0.0);
+}
+// transforms // -----------------------------------------------------------------------------------------------------------------
+
+fn center(coords: vec2<f32>) -> vec2<f32> {
+    return (coords*2.0)-vec2<f32>(1.0);
+}
+fn DDDcenter(coords: vec3<f32>) -> vec3<f32> {
+    return (coords*2.0)-vec3<f32>(1.0);
+}
+fn RX(one: vec3<f32>, theta: f32) -> vec3<f32> {
+    let s = sin(theta);
+    let c = cos(theta);
+
+    let matrix = mat3x3<f32>(
+    vec3<f32>(1.0,0,0),
+    vec3<f32>(0,c,-s),
+    vec3<f32>(0,s,c)
+    );
+    return vec3<f32>(matrix*one);
+}
+fn RY(one: vec3<f32>, theta: f32) -> vec3<f32> {
+    let s = sin(theta);
+    let c = cos(theta);
+
+    let matrix = mat3x3<f32>(
+    vec3<f32>(c,0,s),
+    vec3<f32>(0,1.0,0),
+    vec3<f32>(-s,0,c)
+    );
+    return vec3<f32>(matrix*one);
+}
+fn RZ(one: vec3<f32>, theta: f32) -> vec3<f32> {
+    let s = sin(theta);
+    let c = cos(theta);
+
+    let matrix = mat3x3<f32>(
+    vec3<f32>(c,-s,0,),
+    vec3<f32>(s,c,0),
+    vec3<f32>(0,0,1.0)
+    );
+    return vec3<f32>(matrix*one);
+}
+fn rotate(one: vec3<f32>, two: vec3<f32>) -> vec3<f32> {
+    return RZ(RY(RX(one,two[0]),two[1]),two[2]);
+}
+
+// lighting // -----------------------------------------------------------------------------------------------------------------
+
+fn BeerLambert(density: f32, dist: f32) -> f32 {
+    return exp(-density*dist);
+}
+fn HenyeyGreenstein(g: f32, costh: f32) -> f32 {
+    return (1.0/(4.0*pi))*
+    ((1.0-g*g)/pow(1.0+g*g-2.0*g*costh,1.5));
+}
+fn BeerLambertPowder(density: f32, dist: f32) -> f32 {
+    return exp(-2*(density*dist))+exp(-(density*dist));
+}
+fn sampleDensity( pos: vec3<f32>, sPos: vec3<f32>, densityFalloff: f32, a: f32) -> f32 {
+    //float altitude = length(pos-sPos)-sRadius;
+    //float nAltitude = altitude/(shell-sRadius);
+    var density = exp(-a*densityFalloff)*(1.0-a);
+    return max(density,0.0)*1.0;//0.7;
+}
+fn sampleAltitude(uvPos: vec3<f32>, sPos: vec3<f32>, sRadius: f32, shell: f32) -> f32 {
+    var altitude = length(uvPos-sPos)-sRadius;
+    var altitudeSample = (altitude/(shell-sRadius));
+    return altitudeSample;
+}
+fn sphereIntercepter(uvVec: vec3<f32>, uvPos: vec3<f32>, sPos: vec3<f32>, sRadius: f32) -> sphereIntercept {
+    var ajacentDist = dot(uvVec,sPos-uvPos);
+    var dist = DDDDistance(uvPos,sPos);
+    var within : bool = dist < sRadius;
+    if ((ajacentDist > 0.0) || within) {
+        
+        //float ajacentDist = dot(uvVec,normalize(uvPos-sPos))*dist;
+
+
+        var perpendicularDist = sqrt(-(ajacentDist*ajacentDist)+(dist*dist));
+        var inteceptDist = sqrt((sRadius*sRadius)-(perpendicularDist*perpendicularDist));
+
+        //vec3 close = uvPos+uvVec*(ajacentDist+inteceptDist);
+        //vec3 far = uvPos+uvVec*(ajacentDist-inteceptDist);
+        var bounded : bool = perpendicularDist < sRadius;
+
+
+        return sphereIntercept(
+        inteceptDist,
+        ajacentDist,
+        bounded,// if it intersects or not
+        within // if the ray originates from within the sphere
+        );
+    }
+    return sphereIntercept(
+        -9999.0,
+        9999.0,
+        false,// if it intersects or not
+        false// if the ray originates from within the sphere
+    );
+}
+fn ray(uvVecInit: vec3<f32>, uvPosInit: vec3<f32>, steps: u32) -> rayInfo {
+    var uvVec = uvVecInit;
+    var lod = 1.0;
+    var sdfThresh = 0.2;
+    var voxelTrap = 0.05;
+    var sdfStep = 34.0;
+
+    var hit = vec3<f32>(0.0);
+    var bgPerlin = 0.0;
+    var ray : rayInfo;
+    ray.normal = vec3<f32>(0.0);
+    ray.uv = vec3<f32>(0.0);
+    ray.dist = 0.0;
+
+    var qPos = uvPosInit;
+    var fPos = vec3<f32>(0.0);
+    var vecSign = sign(uvVec)*lod;
+    //if (uvVec.y == 0) {
+    //    vecSign.y = 0.0001;
+    //}
+    var tStep = abs(lod/uvVec);
+    var qStep = vecSign;
+    var t = vec3<f32>(0.0);
+    var mode = 0u;
+    var prev = qPos;
+
+    var stepLength = 0.01;
+
+
+    var SI1 : sphereIntercept = sphereIntercepter(uvVec, uvPosInit, sPos, sRadius);
+    var SI2 : sphereIntercept = sphereIntercepter(uvVec, uvPosInit, sPos, shell);
+    var lightDir = normalize(vec3<f32>(1.0,0.0,0.0));
+    var inscattered = vec3<f32>(0.0);
+    var density = 0.0;
+    var travel = 0.0;
+    var a = 0.0;
+
+    var aEnter = 0.0;
+    var aExit = 0.0;
+    var enterSequence = false;
+
+    if (SI2.bounded) {
+        aExit = min((SI2.ajacentDist+SI2.secantLength),(SI1.ajacentDist-SI1.secantLength));
+        if (SI2.within) {            
+        } else {
+            aEnter = ((SI2.ajacentDist-SI2.secantLength));
+        }
+    }
+
+    for (var x:u32=0;x<steps;x+=1u) {
+        if (mode == 0u) {
+            bgPerlin = DDDValueNoise((floor(qPos/lod)*lod)/50.0)-sdfThresh+((length(qPos-sPos)-groundScale)/100);
+            if (bgPerlin <= voxelTrap) {
+                mode = 1u;
+                prev = qPos;
+                fPos = fract(qPos/lod)*lod;
+                qPos = floor(qPos/lod)*lod;
+                t = (((vecSign+lod)*0.5)-fPos)/uvVec;
+            } else {
+                qPos += uvVec*(bgPerlin*sdfStep); // at 40 the appearance of overshoot begins to be relevant. 
+                ray.dist += (bgPerlin*sdfStep);
+                stepLength = (bgPerlin*sdfStep);
+            }
+        } else {
+            bgPerlin = DDDValueNoise(qPos/50.0)-sdfThresh+((length(qPos-sPos)-groundScale)/100);
+            if (bgPerlin <= 0.0) {
+                //ray.normal = vec3<f32>(x)/400.0; // the computation display
+                ray.normal += inscattered;
+                return ray;
+            }
+            ray.normal = vec3<f32>(0.0);
+            if (t.x<=t.y && t.x<=t.z) {
+                hit = uvVec*t.x;
+                ray.uv = vec3<f32>(((hit+uvPosInit)-floor(hit+uvPosInit)).zy,0.0);//xy
+                ray.normal.x = -qStep.x;
+                ray.dist += tStep.x;
+
+                qPos.x += qStep.x;
+                t.x += tStep.x;
+            } else if (t.y<=t.z) {
+                hit = uvVec*t.y;
+                ray.uv = vec3<f32>(((hit+uvPosInit)-floor((hit+uvPosInit))).xz,0.0);//xz
+                ray.normal.y = -qStep.y;
+                ray.dist += tStep.y;
+
+                qPos.y += qStep.y;
+                t.y += tStep.y;
+            } else {
+                hit = uvVec*t.z;
+                ray.uv = vec3<f32>(((hit+uvPosInit)-floor((hit+uvPosInit))).xy,0.0);//zy
+                ray.normal.z = -qStep.z;
+                ray.dist += tStep.z;
+
+                qPos.z += qStep.z;
+                t.z += tStep.z;
+            }
+            if (bgPerlin >= voxelTrap+0.01) {
+                mode = 0u;
+                qPos = hit+prev+uvVec*1;//uvVec*1 and added step to allow the escaping of this ray from the threshold
+            }
+            stepLength = 1.0;
+        }
+        
+        if (length(qPos-uvPosInit) > aEnter && length(qPos-uvPosInit) < aExit) {
+            if (enterSequence == false) {
+                a = sampleAltitude(qPos, sPos, sRadius, shell); 
+                enterSequence = true;
+            } else {
+                var invShell = 1.0/(shell-sRadius);
+                a += dot(uvVec,normalize(qPos-sPos))*stepLength*invShell;
+            }
+            
+
+            /*if (a < 0.01) {
+                a = sampleAltitude(qPos, sPos, sRadius, shell); 
+            }*/
+            
+            var localDensity = sampleDensity(qPos, sPos, 2.0, a)/sRadius;
+            density += localDensity*stepLength;
+            var opticalDepth = sRayLookup(lightDir, qPos, sPos, a);
+            var transmittence = exp(-(opticalDepth+density)*scatterCo);
+            inscattered += transmittence * stepLength * localDensity * scatterCo;
+        } else {
+            enterSequence = false;
+        }
+    }
+    ray.normal = vec3<f32>(0.0);
+    ray.normal += inscattered;
+    ray.uv = uvVec;
+    return ray;
+}
+fn sRayLookup( lVec: vec3<f32>, uvPos: vec3<f32>, sPos: vec3<f32>, a: f32) -> f32 {
+    //float altitude = length(uvPos-sPos)-sRadius;
+    var altitudeSample = a;
+    //float altitudeSample = (altitude/(shell-sRadius));
+    var dotSample = (dot(normalize(uvPos-sPos),lVec)+1.0)/2.0;
+    var uv = vec2<f32>(dotSample,altitudeSample);
+    return samplerOpticalDepth(uv);
+}
+@compute @workgroup_size(8,8)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    //let size = textureDimentions(outputTex);
+    let size = params.size;
+    //let index = id.y*size.x+id.x;
+    let fSize = vec2<f32>(f32(size.x),f32(size.y));
+    let coord = vec2<f32>(f32(id.x)/fSize.x, f32(id.y)/fSize.y);
+    let nMouse = center(params.mouse/fSize);
+    var uv = center(coord);
+    uv.x *= fSize.x/fSize.y;
+    let downsample = f32(1.0/10.0);
+
+    //let wPos = vec3<f32>(params.seconds*0.5,params.seconds*0.5+0.5,params.seconds*0.5);
+    //let wPos = vec3<f32>(cos(params.seconds*0.5)*16,0,sin(params.seconds*0.5)*16);
+    let wPos = vec3<f32>(player.playerPos);
+    let fov : f32 = 1.0;
+    //let uvRot = rotate(vec3<f32>(uv,fov),vec3<f32>(0,params.seconds*0.2+pi/2,0));
+
+    let uvRot = rotate(vec3<f32>(uv,fov),vec3<f32>(player.playerAngle.y,player.playerAngle.x-pi*0.5,0.0));
+    let uvVec = normalize(uvRot);
+    var uvPos = wPos;
+
+    if (id.x >= size.x || id.y >= size.y) { // cull coords outside screenspace.
+        return;
+    }
+
+    let ray = ray(uvVec, uvPos, 300u);
+    var value = vec3<f32>(ray.normal);
+    //var value = samplerOpticalDepth(coord);
+    //let color = vec4<f32>(value, value, value, 1.0);
+
+    let color = vec4<f32>(value, 1.0);
+    textureStore(outputTex, id.xy, color);
+}

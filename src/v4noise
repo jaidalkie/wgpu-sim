@@ -1,0 +1,245 @@
+struct SimParams {
+    size : vec2<u32>,
+    seconds: f32,
+    delta: f32,
+};
+struct vector8 {
+    a : vec4<f32>,
+    b : vec4<f32>,
+};
+
+const pi = 3.14159265359;
+//struct Node {
+//    next: u32;
+//    color: vec4<f32>;
+//}
+
+@group(0) @binding(0)
+var outputTex : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(1)
+var<uniform> params : SimParams;
+
+//@group(0) @binding(2)
+//var<storage, read_write> nodes : array<Node>;
+//@group(0) @binding(3)
+//var<storage, read_write> head : array<u32>;
+//@group(0) @binding(4)
+//var<storage, read_write> allocCounter: atomic<u32>;
+
+fn center(coords: vec2<f32>) -> vec2<f32> {
+    return (coords*2.0)-vec2<f32>(1.0);
+}
+
+fn DDHasher(number: vec2<f32>) -> f32 {
+    let number2 = (1./4320.0)*(number)+vec2<f32>(0.25,0.); 
+    let state = fract(dot(number2*number2,vec2<f32>(3571)));
+    return fract(state*state*(3571.*2.));
+}
+
+fn DDDHasher(number: vec3<f32>) -> f32 {
+    var number2 = fract(number*.1033);
+    number2 = number2 + (dot(number2,number2.yzx + 33.33));
+    return fract((number2.x + number2.y)*number2.z);
+}
+
+fn DDHashVec(coords: vec2<f32>) -> vec2<f32> {
+    let hashed = DDHasher(coords)*2*pi;
+    return normalize(vec2<f32>(cos(hashed),sin(hashed)));
+}
+
+fn DDDHashVec(coords: vec3<f32>) -> vec3<f32> { // may have artifacts in its hashing function
+    var number2 = fract(coords*vec3<f32>(.1031, .1030, .0973));
+    number2 = number2 + dot(number2, number2.yzx+33.33);
+    let hashed = fract((number2.xx+number2.yz)*number2.zy)*2*pi;
+
+    return normalize(vec3<f32>(
+    cos(hashed.y)*cos(hashed.x),
+    sin(hashed.y),
+    cos(hashed.y)*sin(hashed.x)
+    ));
+}
+
+fn DDHash(coords: vec2<f32>) -> vec2<f32> {
+    let res = 100.0;
+    let hashed = floor(DDHasher(coords)*(res*res));
+    let x = f32((hashed%res)/res);
+    let y = f32(floor(hashed/res)/res);
+    return vec2<f32>(x,y);
+}
+
+fn DDDHash(coords: vec3<f32>) -> vec3<f32> {
+    let res = 100.0;
+    let hashed = floor(DDDHasher(coords)*(res*res*res));
+    let x = hashed%res;
+    let y = floor(hashed/res)%(res);
+    let z = floor(hashed/(res*res));
+    return vec3<f32>(f32(x/res),f32(y/res),f32(z/res));
+}
+
+fn setVec4(v: vec4<f32>, idx: u32, value: f32) -> vec4<f32> {
+    var r = v;
+    switch idx {
+        case 0u: { r.x = value; }
+        case 1u: { r.y = value; }
+        case 2u: { r.z = value; }
+        case 3u: { r.w = value; }
+        default {}
+    }
+    return r;
+}
+
+fn octoDot(qO: vec3<f32>, qC: vec3<f32>) -> vector8 {
+    let pos = qC+qO;
+    var octoDot : vector8;
+    octoDot.a = vec4<f32>(0.0);
+    octoDot.b = vec4<f32>(0.0);
+    var counter : u32 = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,0);
+            let qVec = DDDHashVec(qPos+qO);
+            octoDot.a = setVec4(
+                octoDot.a,
+                counter,
+                dot(qVec, qC-qPos)
+            );
+            counter = counter + 1;
+        }
+    }
+    counter = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec3<f32>(x,y,1);
+            let qVec = DDDHashVec(qPos+qO);
+            octoDot.b = setVec4(
+                octoDot.b,
+                counter,
+                dot(qVec, qC-qPos)
+            );
+            counter = counter + 1;
+        }
+    }
+    return octoDot;
+}
+
+fn quadDot(qO: vec2<f32>, qC: vec2<f32>) -> vec4<f32> {
+    var quadDot = vec4<f32>(0.0);
+    var counter : u32 = 0u;
+    for (var y:f32=0;y<2.0;y=y+1.0) {
+        for (var x:f32=0;x<2.0;x=x+1.0) {
+            let qPos = vec2<f32>(x,y);
+            let qVec = DDHashVec(qPos+qO);
+            quadDot[counter] = dot(qVec, qC-qPos);
+            counter = counter + 1;
+        }
+    }
+    return quadDot;
+}
+
+fn linTerp(ratio: f32, one: f32, two: f32) -> f32 {
+    return one+(ratio)*(two-one);
+}
+
+fn fade(weight: f32) -> f32 {
+    return weight*weight*weight*(weight*(weight*6.0-15.0)+10.0);
+}
+
+fn quadlerpfaded(qCoord: vec2<f32>, values: vec4<f32>) -> f32 {
+    let faded = vec2<f32>(fade(qCoord.x),fade(qCoord.y));
+    let one = linTerp(faded.x,values.r,values.g);
+    let two = linTerp(faded.x,values.b,values.a);
+    return linTerp(faded.y,one,two);
+}
+
+fn octolerpfaded(qC: vec3<f32>, values: vector8) -> f32 {
+    let faded = fade(qC.z);
+    let one = quadlerpfaded(qC.xy,values.a);
+    let two = quadlerpfaded(qC.xy,values.b);
+    return linTerp(faded,one,two);
+}
+
+fn perlin(coord: vec2<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+    return (quadlerpfaded(qC,quadDot(qO,qC))+1)/2;
+}
+
+fn DDDperlin(coord: vec3<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+    return (octolerpfaded(qC,octoDot(qO,qC))+1)/2;
+}
+
+fn DDDistance(one: vec2<f32>, two: vec2<f32>) -> f32 {
+    let dx = one.x-two.x;
+    let dy = one.y-two.y;
+    return sqrt(dx*dx+dy*dy);
+}
+
+fn worly(coord: vec2<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+
+    var minimum = 9999.0;
+    let pos = qC+qO;
+    for (var x:f32=-1.0;x<2.0;x=x+1.0) {
+        for (var y:f32=-1.0;y<2.0;y=y+1.0) {
+            let qPos = vec2<f32>(x,y)+qO;
+            let hashedQPos = DDHash(qPos)+qPos;
+            let dist = DDDistance(pos,hashedQPos);
+            if (minimum > dist) {
+                minimum = dist;
+            }
+        }
+    }
+    return min(minimum,1.0);// could use the real upperbound but it has diminishing returns:  /sqrt(2)
+}
+
+fn DDDDistance(one: vec3<f32>, two: vec3<f32>) -> f32 {
+    let dx = one.x-two.x;
+    let dy = one.y-two.y;
+    let dz = one.z-two.z;
+    return sqrt(dx*dx+dy*dy+dz*dz);
+}
+
+fn DDDWorly(coord: vec3<f32>) -> f32 {
+    let qC = fract(coord);
+    let qO = floor(coord);
+
+    var minimum = 999999.0;
+    let pos = qC+qO;
+    for (var x:f32=-1.0;x<2.0;x=x+1.0) {
+        for (var y:f32=-1.0;y<2.0;y=y+1.0) {
+            for (var z:f32=-1.0;z<2.0;z=z+1.0) {
+                let qPos = vec3<f32>(x,y,z)+qO;
+                let hashedQPos = DDDHash(qPos)+qPos;
+                let dist = DDDDistance(pos,hashedQPos);
+                if (minimum > dist) {
+                    minimum = dist;
+                }
+            }
+        }
+    }
+    return min(minimum,1.0);// could use the real upperbound but it has diminishing returns: /sqrt(3);
+}
+
+@compute @workgroup_size(8,8)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    //let size = textureDimentions(outputTex);
+    let size = params.size;
+    let index = id.y*size.x+id.x;
+    let coord = vec2<f32>((f32(id.x))/f32(size.x), (f32(id.y))/f32(size.y));
+    let downsample = f32(1.0/100.0);
+
+    if (id.x >= size.x || id.y >= size.y) { // cull coords outside screenspace.
+        return;
+    }
+
+    //let value = vec3<f32>(perlin(coord/downsample)*2-1);
+    //let value = vec3<f32>(DDDperlin(vec3<f32>(coord/downsample,params.seconds*1.0))*2-1);
+    let value = vec3<f32>(DDDWorly(vec3<f32>(coord/downsample,params.seconds*1.0)));
+    
+    let color = vec4<f32>(value, 1.0);
+    textureStore(outputTex, id.xy, color);
+    
+}
